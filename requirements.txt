@@ -1,5 +1,6 @@
-transformers
-accelerate 
-torch 
-langchain-community  
+accelerate
+langchain
+langchain-community
 streamlit
+torch
+transformers
