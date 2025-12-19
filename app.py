@@ -1,12 +1,9 @@
 import streamlit as st
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
 import re
-import torch  # For device management
-from langchain_community.llms import HuggingFacePipeline
 from langchain_core.tools import tool
-from langchain.agents import initialize_agent, AgentType
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
+from langchain.agents import create_react_agent
+from langchain import hub  # For pulling ReAct prompt
 
 # Load emotion and sentiment models (same as original)
 emotion_classifier = pipeline("text-classification", model="bhadresh-savani/distilbert-base-uncased-emotion")
@@ -53,7 +50,6 @@ model_id = "mistralai/Mistral-7B-v0.1"
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 model = AutoModelForCausalLM.from_pretrained(
     model_id,
-    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
     device_map="auto"  # Automatically use GPU if available
 )
 hf_pipeline = pipeline(
@@ -66,25 +62,24 @@ hf_pipeline = pipeline(
     repetition_penalty=1.15
 )
 
-# Wrap in LangChain's HuggingFacePipeline
-llm = HuggingFacePipeline(pipeline=hf_pipeline)
+# Custom LLM wrapper (trick to avoid HuggingFacePipeline/LLMChain)
+class CustomLLM:
+    def __call__(self, prompt: str) -> str:
+        return hf_pipeline(prompt)[0]['generated_text']
 
-# Initialize agent with tools
+llm = CustomLLM()
+
+# Pull ReAct prompt from hub (replaces custom prompt/chain)
+prompt = hub.pull("hwchase17/react")
+
+# Initialize agent with tools (updated to create_react_agent)
 tools = [split_sentences, classify_emotions, compute_drift_score, get_overall_sentiment]
-agent = initialize_agent(
-    tools,
-    llm,
-    agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+agent = create_react_agent(
+    llm=llm,
+    tools=tools,
+    prompt=prompt,
     verbose=True  # For debugging; set to False in production
 )
-
-# Custom prompt for agent to focus on emotion analysis
-prompt_template = PromptTemplate(
-    input_variables=["input"],
-    template="You are an emotion drift analysis agent. Analyze the user's query about text emotions, drift, or sentiment. Use tools to process. Query: {input}"
-)
-
-chain = LLMChain(llm=llm, prompt=prompt_template)
 
 # Streamlit chat interface
 st.title("Emotion Drift AI Agent (Powered by Mistral-7B-v0.1)")
@@ -105,9 +100,8 @@ if user_input := st.chat_input("Ask about emotion analysis (e.g., 'Analyze this 
         st.markdown(user_input)
 
     with st.chat_message("assistant"):
-        # Run agent through chain
-        prompted_input = prompt_template.format(input=user_input)
-        response = agent.run(prompted_input)
+        # Run agent directly (no chain needed)
+        response = agent.invoke({"input": user_input})['output']
         
         # Post-process response (e.g., format timeline if detected)
         st.markdown(response)
