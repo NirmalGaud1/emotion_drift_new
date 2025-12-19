@@ -1,4 +1,4 @@
-install 
-torch 
-accelerate 
-bitsandbytes
+streamlit
+torch
+transformers>=4.43.1
+accelerate
