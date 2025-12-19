@@ -1,44 +1,57 @@
 import streamlit as st
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
 import re
+import ast
+import torch
 
-# Load emotion and sentiment models (same as original)
-emotion_classifier = pipeline("text-classification", model="bhadresh-savani/distilbert-base-uncased-emotion")
-sentiment_classifier = pipeline("sentiment-analysis", model="distilbert/distilbert-base-uncased-finetuned-sst-2-english")
+# --- CONFIGURATION ---
+# Using a smaller model for stability, or stay with Mistral if you have 24GB+ VRAM
+MODEL_ID = "mistralai/Mistral-7B-v0.1" 
 
-# Emoji mapping (same as original)
-emoji_map = {
-    'joy': '😊',
-    'anger': '😠',
-    'sadness': '😢',
-    'fear': '😨',
-    'love': '❤️',
-    'surprise': '😲'
-}
+@st.cache_resource
+def load_models():
+    # Emotion & Sentiment pipelines
+    emo = pipeline("text-classification", model="bhadresh-savani/distilbert-base-uncased-emotion")
+    sent = pipeline("sentiment-analysis", model="distilbert/distilbert-base-uncased-finetuned-sst-2-english")
+    
+    # LLM Loading with optimization
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        device_map="auto", # Automatically chooses GPU if available
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        low_cpu_mem_usage=True
+    )
+    
+    gen_pipeline = pipeline(
+        "text-generation",
+        model=model,
+        tokenizer=tokenizer,
+        max_new_tokens=256,
+        temperature=0.1 # Lower temperature for more consistent tool use
+    )
+    return emo, sent, gen_pipeline
 
-# Define tool functions (without @tool)
+emotion_classifier, sentiment_classifier, hf_pipeline = load_models()
+
+# --- TOOL DEFINITIONS ---
 def split_sentences(text: str) -> list:
-    """Split input text into sentences."""
     text = re.sub(r'\s+', ' ', text.strip())
     sentences = re.split(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|\!)\s', text)
     return [s.strip() for s in sentences if s.strip()]
 
 def classify_emotions(sentences: list) -> list:
-    """Classify emotions for a list of sentences."""
+    if isinstance(sentences, str): sentences = [sentences]
     return [emotion_classifier(s)[0]['label'] for s in sentences]
 
 def compute_drift_score(emotions: list) -> float:
-    """Compute emotion drift score from a list of emotions."""
-    if len(emotions) <= 1:
-        return 0.0
+    if len(emotions) <= 1: return 0.0
     num_changes = sum(1 for i in range(1, len(emotions)) if emotions[i] != emotions[i-1])
-    return num_changes / (len(emotions) - 1)
+    return round(num_changes / (len(emotions) - 1), 2)
 
 def get_overall_sentiment(text: str) -> str:
-    """Get overall sentiment for the input text."""
     return sentiment_classifier(text)[0]['label'].upper()
 
-# Tools dict
 tools = {
     "split_sentences": split_sentences,
     "classify_emotions": classify_emotions,
@@ -46,113 +59,64 @@ tools = {
     "get_overall_sentiment": get_overall_sentiment
 }
 
-# Load Mistral-7B-v0.1 locally (fixed loading)
-model_id = "mistralai/Mistral-7B-v0.1"
-tokenizer = AutoTokenizer.from_pretrained(model_id)
-model = AutoModelForCausalLM.from_pretrained(
-    model_id,
-    low_cpu_mem_usage=True  # Fix for meta tensor error on CPU
-)
-hf_pipeline = pipeline(
-    "text-generation",
-    model=model,
-    tokenizer=tokenizer,
-    max_new_tokens=512,
-    temperature=0.7,
-    top_p=0.95,
-    repetition_penalty=1.15
-)
+# --- AGENT LOGIC ---
+REACT_PROMPT = """You are an assistant that uses tools to analyze text.
+Available tools:
+- split_sentences(text): Breaks text into list of sentences.
+- classify_emotions(list_of_sentences): Returns list of emotions.
+- compute_drift_score(list_of_emotions): Returns a 0-1 score of emotional change.
+- get_overall_sentiment(text): Returns POSITIVE or NEGATIVE.
 
-# Custom LLM wrapper with stripping prompt
-class CustomLLM:
-    def __call__(self, prompt: str) -> str:
-        full = hf_pipeline(prompt)[0]['generated_text']
-        return full[len(prompt):].strip()
+Format:
+Thought: Reason about what to do.
+Action: tool_name(input)
+Observation: tool result
+... (repeat)
+Final Answer: summarize everything.
 
-llm = CustomLLM()
-
-# Hardcode ReAct prompt
-react_prompt = """
-You are an agent that uses tools to answer questions. Use the following format:
-
-Thought: [your reasoning]
-
-Action: tool_name(tool_input as python literal, e.g., "text" or ["list"])
-
-Observation: [result from tool]
-
-... (repeat Thought/Action/Observation as needed)
-
-Final Answer: [final response]
-
-Available tools: split_sentences, classify_emotions, compute_drift_score, get_overall_sentiment
+Question: {query}
 """
 
-# Parse action function
-def parse_action(action_str):
-    match = re.match(r'(\w+)\((.*)\)', action_str.strip(), re.DOTALL)
+def parse_action(gen_text):
+    # Find Action: ... and stop before the next Observation or Thought
+    match = re.search(r"Action:\s*(\w+)\((.*)\)", gen_text)
     if match:
-        name = match.group(1)
-        input_str = match.group(2)
-        try:
-            input_val = eval(input_str)
-            return name, input_val
-        except:
-            return None, None
+        return match.group(1), match.group(2)
     return None, None
 
-# Custom agent loop
-def custom_agent_run(input_query):
-    messages = react_prompt + "\nQuestion: " + input_query + "\n"
-    max_iterations = 5
-    for _ in range(max_iterations):
-        generation = llm(messages)
-        messages += generation
-        if "Final Answer:" in generation:
-            return generation.split("Final Answer:")[-1].strip()
-        elif "Action:" in generation:
-            action_part = generation.split("Action:")[-1].split("\n")[0].strip()
-            tool_name, tool_input = parse_action(action_part)
-            if tool_name and tool_name in tools:
-                try:
-                    observation = tools[tool_name](tool_input)
-                    messages += "\nObservation: " + str(observation) + "\n"
-                except Exception as e:
-                    messages += "\nObservation: Error - " + str(e) + "\n"
-            else:
-                messages += "\nObservation: Invalid tool\n"
+def run_agent(query):
+    prompt = REACT_PROMPT.format(query=query)
+    iterations = 0
+    
+    while iterations < 5:
+        output = hf_pipeline(prompt, stop_sequence=["Observation:"])[0]['generated_text']
+        new_content = output[len(prompt):]
+        prompt += new_content
+        
+        if "Final Answer:" in new_content:
+            return new_content.split("Final Answer:")[-1].strip()
+        
+        tool_name, tool_input_str = parse_action(new_content)
+        if tool_name in tools:
+            try:
+                # Safer than eval()
+                clean_input = ast.literal_eval(tool_input_str)
+                observation = tools[tool_name](clean_input)
+                obs_text = f"\nObservation: {observation}\nThought: "
+                prompt += obs_text
+            except Exception as e:
+                prompt += f"\nObservation: Error processing input: {e}\n"
         else:
-            messages += "\nNo action or final answer found\n"
-    return "Max iterations reached"
+            break
+        iterations += 1
+    return "The agent could not reach a final answer."
 
-# Streamlit chat interface
-st.title("Emotion Drift AI Agent (Powered by Mistral-7B-v0.1)")
+# --- STREAMLIT UI ---
+st.title("🧠 Emotion Drift Agent")
 
-# Initialize chat history
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-# Display chat history
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-# User input
-if user_input := st.chat_input("Ask about emotion analysis (e.g., 'Analyze this text: Hello, I feel great! But anxious.')"):
-    st.session_state.messages.append({"role": "user", "content": user_input})
-    with st.chat_message("user"):
-        st.markdown(user_input)
-
+if user_input := st.chat_input("Enter text for emotional analysis"):
+    st.chat_message("user").write(user_input)
     with st.chat_message("assistant"):
-        # Run custom agent
-        response = custom_agent_run(user_input)
-        
-        # Post-process response (e.g., format timeline if detected)
-        st.markdown(response)
-        
-        # Optional: If response mentions emotions, visualize (agent can describe, but we can enhance)
-        if "emotions" in response.lower():
-            # Example: Extract and show emoji timeline (agent handles logic, but demo here)
-            pass  # Add custom visualization if needed
-
-    st.session_state.messages.append({"role": "assistant", "content": response})
+        with st.spinner("Thinking..."):
+            response = run_agent(user_input)
+            st.write(response)
