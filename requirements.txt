@@ -1,6 +1,5 @@
-accelerate
-langchain
-langchain-community
+install 
+torch 
+accelerate 
+bitsandbytes
 streamlit
-torch
-transformers
