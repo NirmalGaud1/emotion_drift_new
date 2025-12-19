@@ -46,12 +46,12 @@ tools = {
     "get_overall_sentiment": get_overall_sentiment
 }
 
-# Load Mistral-7B-v0.1 locally (no API, no Ollama)
+# Load Mistral-7B-v0.1 locally (fixed loading)
 model_id = "mistralai/Mistral-7B-v0.1"
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 model = AutoModelForCausalLM.from_pretrained(
     model_id,
-    device_map="auto"  # Automatically use GPU if available
+    low_cpu_mem_usage=True  # Fix for meta tensor error on CPU
 )
 hf_pipeline = pipeline(
     "text-generation",
